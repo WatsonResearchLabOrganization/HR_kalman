@@ -1,0 +1,104 @@
+import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt
+import datetime
+import numpy as np
+import ampdlib
+
+# --- Configuration ---
+filename = 'Highpass_filter/ppg_lumos.txt'
+lowcut = 0.3    # Hz, lower cutoff frequency
+highcut = 2.5   # Hz, upper cutoff frequency
+
+def parse_line(line):
+    parts = line.strip().split('->')
+    if len(parts) != 2:
+        return None, None
+    
+    timestamp_str = parts[0].strip()
+    value_str = parts[1].strip()
+    
+    try:
+        t = datetime.datetime.strptime(timestamp_str, '%H:%M:%S.%f')
+    except ValueError:
+        return None, None
+    
+    try:
+        value = float(value_str)
+    except ValueError:
+        return None, None
+    
+    return t, value
+
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+# Read data
+times = []
+values = []
+
+with open(filename, 'r') as f:
+    for line in f:
+        if '->' in line:
+            t, val = parse_line(line)
+            if t is not None and val is not None:
+                times.append(t)
+                values.append(val)
+
+if len(times) < 2:
+    raise ValueError("Not enough data points read from the file.")
+
+# Convert times to seconds from start
+start_time = times[0]
+time_seconds = np.array([(t - start_time).total_seconds() for t in times])
+values = np.array(values)
+
+# Estimate sampling frequency
+dt = np.diff(time_seconds)
+avg_dt = np.mean(dt)
+fs = 1.0 / avg_dt
+print(f"Estimated sampling frequency: {fs:.2f} Hz")
+
+# Bandpass filter
+b, a = butter_bandpass(lowcut, highcut, fs, order=4)
+filtered_values = filtfilt(b, a, values)
+
+# Run AMPD on unfiltered signal
+ampd_peaks_unfiltered = ampdlib.ampd_fast(values, window_length=2000)
+peak_times_unfiltered = time_seconds[ampd_peaks_unfiltered]
+
+# Run AMPD on filtered signal
+ampd_peaks_filtered = ampdlib.ampd_fast(filtered_values, window_length=2000)
+peak_times_filtered = time_seconds[ampd_peaks_filtered]
+
+# Compute heart rate from filtered peaks as before (just as an example)
+if len(peak_times_filtered) < 2:
+    print("Not enough peaks detected in the filtered signal to compute heart rate.")
+else:
+    rr_intervals = np.diff(peak_times_filtered)
+    avg_rr = np.mean(rr_intervals)
+    heart_rate = 60.0 / avg_rr
+    print(f"Estimated Heart Rate (Filtered): {heart_rate:.2f} BPM")
+
+# Plot original vs filtered signals and their detected peaks
+plt.figure(figsize=(12, 6))
+plt.plot(time_seconds, values, label='Original Signal', alpha=0.7)
+plt.plot(time_seconds, filtered_values, label='Filtered Signal', linewidth=2)
+
+# Mark peaks on original signal
+if len(ampd_peaks_unfiltered) > 0:
+    plt.plot(peak_times_unfiltered, values[ampd_peaks_unfiltered], 'rx', label='Unfiltered Peaks')
+
+# Mark peaks on filtered signal
+if len(ampd_peaks_filtered) > 0:
+    plt.plot(peak_times_filtered, filtered_values[ampd_peaks_filtered], 'go', label='Filtered Peaks')
+
+plt.title('PPG Signal - Unfiltered vs Filtered with Detected Peaks')
+plt.xlabel('Time (s)')
+plt.ylabel('Sensor Reading')
+plt.legend()
+plt.grid(True)
+plt.show()

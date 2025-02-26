@@ -1,0 +1,36 @@
+[build-system]
+requires = [
+    "setuptools"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ampdLib"
+version = "1.1.5"
+description = "Implementation of AMPD algorithm for peak detection in quasi-periodic signals"
+readme = "README.md"
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Development Status :: 5 - Production/Stable",
+    "Topic :: Scientific/Engineering"
+]
+keywords = ['peak detection', 'signal processing', 'quasi-periodic signals']
+dependencies = [
+    "numpy"
+]
+
+[project.optional-dependencies]
+tests = [
+    "scipy"
+]
+
+[project.urls]
+homepage = "https://github.com/LucaCerina/ampdLib"
+
+[metadata]
+author = "LucaCerina"
+author_email = "lccerina@gmail.com"
+license = "Apache-2.0"
