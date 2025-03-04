@@ -20,7 +20,8 @@ STEP_SIZE = 1.0       # seconds
 DATAFOLDER = r"physionet.org\files\pulse-transit-time-ppg\1.1.0\csv"
 LOG_FILE = "evaluation_log.txt"
 
-# If you want to see an interactive waveform + ground-truth for a specific file (e.g. "s6_sit.csv"), set it here:
+# If you want to see an interactive waveform + ground-truth for a specific file, set it here:
+# e.g. PLOT_SPECIFIC_FILE = "s6_sit.csv"
 PLOT_SPECIFIC_FILE = ""
 
 # =======================
@@ -67,14 +68,13 @@ def generate_hr_timeseries(peak_times, total_duration, window_size, step_size):
 
 def evaluate_time_series_hr(gt_times, fused_times, IR_times, total_dur):
     """
-    Build time-aligned HR (BPM) for ground truth (GT), fused, and pleth_2.
-    Compute **RMSE** for (fused vs GT) and (pleth_2 vs GT).
-
+    Build time-aligned HR (BPM) for ground truth (GT), fused, and IR.
+    Compute RMSE for (fused vs GT) and (IR vs GT).
     Returns (rmse_fused, rmse_IR, detail).
     """
     gt_t,  gt_hr  = generate_hr_timeseries(gt_times,     total_dur, WINDOW_SIZE, STEP_SIZE)
     fu_t,  fu_hr  = generate_hr_timeseries(fused_times,  total_dur, WINDOW_SIZE, STEP_SIZE)
-    pl_t,  pl_hr  = generate_hr_timeseries(IR_times, total_dur, WINDOW_SIZE, STEP_SIZE)
+    pl_t,  pl_hr  = generate_hr_timeseries(IR_times,     total_dur, WINDOW_SIZE, STEP_SIZE)
 
     # unify times
     common_times = set(gt_t).intersection(fu_t).intersection(pl_t)
@@ -119,91 +119,156 @@ def evaluate_time_series_hr(gt_times, fused_times, IR_times, total_dur):
 
 def kalman_fuse_3channels(df, channels, fs):
     """
-    (1) Bandpass each channel individually,
-    (2) Kalman-fuse the filtered signals,
-    (3) Return fused signal (not re-filtered).
+    1) Bandpass each channel individually,
+    2) Estimate an 'SNR' for each channel sample (toy example),
+    3) Form a single scalar measurement z(t) = sum_i [ SNR_i(t) * pleth_i(t) ],
+    4) Use a 1D Kalman Filter (dim_x=1, dim_z=1) to track that sum over time,
+    5) Return the fused signal (which can exceed the largest single-channel amplitude).
+
+    NOTE: This is a non-traditional 'fusion': 
+       - Instead of H = [1,1,1]^T and a multi-measurement update, 
+         we define a single measurement = (SNR-weighted sum).
+       - Weighted by SNR so that high-SNR channels push z(t) up more strongly.
+
+    You can replace the SNR calculation logic with your own (e.g., rolling SNR, 
+    or some known SNR from a separate process). 
     """
+
+    from filterpy.kalman import KalmanFilter
+
+    # 1) Filter each channel
     filtered_signals = []
     for ch in channels:
         raw_data = df[ch].to_numpy()
         filtered_data = bandpass_filter(raw_data, fs, LOWCUT, HIGHCUT, FILTER_ORDER)
         filtered_signals.append(filtered_data)
+    # shape = (3, N)
+    filtered_signals = np.array(filtered_signals)
 
-    filtered_matrix = np.column_stack(filtered_signals)
+    N = filtered_signals.shape[1]
 
-    kf = KalmanFilter(dim_x=1, dim_z=len(channels))
-    initial_val = np.mean(filtered_matrix[0])
+    # 2) Estimate "SNR" for each channel at each sample
+    #    Here, we do something *very naive*: SNR_i(t) = abs(filtered_signals[i,t]) 
+    #    with some small floor to avoid zero.
+    #    Replace with your own real SNR estimation!
+    snr_vals = np.abs(filtered_signals) + 1.0  # shape = (3, N)
+
+    # 3) Build the single measurement z(t) at each time step
+    #    z(t) = sum_i [ SNR_i(t) * channel_i(t) ]
+    #    This can exceed the largest channel if the others are in phase or large.
+    z_measurements = []
+    for t in range(N):
+        # sum of SNR_i(t) * pleth_i(t)
+        z_t = 0.0
+        for i in range(len(channels)):
+            z_t += snr_vals[i,t] * filtered_signals[i,t]
+        z_measurements.append(z_t)
+    z_measurements = np.array(z_measurements)
+
+    # 4) Setup a single-dimension Kalman Filter
+    kf = KalmanFilter(dim_x=1, dim_z=1)
+    # state = fused amplitude
+    initial_val = z_measurements[0]  # or some smaller guess
     kf.x = np.array([[initial_val]])
     kf.P *= 10.0
-    kf.F = np.array([[1.]])
-    kf.H = np.ones((len(channels), 1))
-    kf.R = np.eye(len(channels)) * 1.0
-    kf.Q = np.array([[0.1]])
+    kf.F = np.array([[1.]])    # we assume x_{k+1} = x_k + process_noise
+    kf.H = np.array([[1.]])    # measurement = x + measurement_noise
+    kf.Q = np.array([[0.1]])   # tune this for more/less smoothing
 
     fused_signal = []
-    for meas in filtered_matrix:
+    P_history = []
+
+    for t in range(N):
+        # We want R to be smaller if sum of SNR_i(t) is large => we trust z(t) strongly
+        sum_snr_t = np.sum(snr_vals[:, t])
+        # e.g. pick R(t) = 1 / (sum_snr_t^2) or some function
+        # or set a floor so we don't get too small
+        R_t = 1.0 / (sum_snr_t**2 + 1.0)  # toy example
+        kf.R = np.array([[R_t]]) 
+
+        # standard KF steps
         kf.predict()
-        kf.update(meas.reshape(len(channels), 1))
+        kf.update(z_measurements[t])
         fused_signal.append(kf.x[0, 0])
+        P_history.append(kf.P[0, 0])
 
-    return np.array(fused_signal)
+    fused_signal = np.array(fused_signal)
 
-# --------------------------------------------------
-# Plotting function to show Fused & pleth_2 waveforms with ground-truth
-# --------------------------------------------------
-def plot_signals_with_groundtruth(df, fused_signal, fused_peaks_idx, IR_filtered, IR_peaks_idx):
+    return fused_signal, np.array(P_history), filtered_signals
+
+
+
+def plot_all_signals_and_kalmanP(df,
+                                 filtered_signals,  # shape: (3, N)
+                                 fused_signal, fused_peaks_idx,
+                                 IR_filtered, IR_peaks_idx,
+                                 P_history):
     """
-    Create an interactive plot with 2 subplots:
-      - Top: fused_signal with fused peaks + vertical lines for ECG ground-truth
-      - Bottom: pleth_2 filtered with IR peaks + vertical lines for ECG ground-truth
+    Plots, for a single file:
+      1) The three filtered PPG channels, with ground-truth peaks as vlines.
+      2) The fused PPG, with fused and IR peaks, and ground-truth peaks.
+      3) The Kalman filter's error covariance (P) over time.
     """
-    gt_ecg_times = df.loc[df["peaks"] == 1, "time_sec"].values  # ground-truth peak times
     time_vals = df["time_sec"].values
 
-    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-    # --- Fused signal ---
-    axes[0].set_title("Fused Signal (Kalman) + AMPD Peaks + ECG GroundTruth")
-    axes[0].plot(time_vals, fused_signal, 'k-', label="Fused")
+    # Ground truth peak times
+    gt_ecg_times = df.loc[df["peaks"] == 1, "time_sec"].values
+    
+    # Create 3 subplots
+    fig, axs = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+    fig.suptitle("PPG Channels, Fused Signal, and Kalman Covariance")
+
+    # Subplot #1: The three PPG channels
+    axs[0].set_title("Filtered PPG Channels (pleth_1, pleth_2, pleth_3) + ECG GT peaks")
+    axs[0].plot(time_vals, filtered_signals[0], label="pleth_1")
+    axs[0].plot(time_vals, filtered_signals[1], label="pleth_2")
+    axs[0].plot(time_vals, filtered_signals[2], label="pleth_3")
+    # Vertical lines for ground truth peaks
+    y_min, y_max = axs[0].get_ylim()
+    axs[0].vlines(gt_ecg_times, y_min, y_max, color='g', alpha=0.3, linewidth=1.0, label="ECG GT")
+    axs[0].legend()
+    axs[0].grid(True)
+
+    # Subplot #2: Fused signal, fused peaks, IR peaks, GT peaks
+    axs[1].set_title("Fused Signal + Detected Peaks + ECG GT peaks")
+    axs[1].plot(time_vals, fused_signal, label="Fused")
     if len(fused_peaks_idx):
-        axes[0].plot(time_vals[fused_peaks_idx], fused_signal[fused_peaks_idx],
-                     'ro', markersize=5, label="Fused Peaks")
-    # draw ECG ground-truth as vertical lines
-    y_min, y_max = axes[0].get_ylim()
-    axes[0].vlines(gt_ecg_times, y_min, y_max, color='g', alpha=0.3, linewidth=1.0, label="ECG GT peaks")
-
-    axes[0].grid(True)
-    axes[0].legend()
-
-    # --- Single channel pleth_2 ---
-    axes[1].set_title("pleth_2 (Filtered) + AMPD Peaks + ECG GroundTruth")
-    axes[1].plot(time_vals, IR_filtered, 'b-', label="pleth_2 Filtered")
+        axs[1].plot(time_vals[fused_peaks_idx], fused_signal[fused_peaks_idx],
+                    'ro', markersize=5, label="Fused Peaks")
+    # We can also plot IR peaks here
     if len(IR_peaks_idx):
-        axes[1].plot(time_vals[IR_peaks_idx], IR_filtered[IR_peaks_idx],
-                     'rx', markersize=5, label="pleth_2 Peaks")
-    # draw ECG ground-truth as vertical lines
-    y_min2, y_max2 = axes[1].get_ylim()
-    axes[1].vlines(gt_ecg_times, y_min2, y_max2, color='g', alpha=0.3, linewidth=1.0, label="ECG GT peaks")
+        axs[1].plot(time_vals[IR_peaks_idx], IR_filtered[IR_peaks_idx],
+                    'kx', markersize=5, label="IR (pleth_2) Peaks")
+    # Ground truth peak lines
+    y_min2, y_max2 = axs[1].get_ylim()
+    axs[1].vlines(gt_ecg_times, y_min2, y_max2, color='g', alpha=0.3, linewidth=1.0)
+    axs[1].legend()
+    axs[1].grid(True)
 
-    axes[1].grid(True)
-    axes[1].legend()
-    axes[1].set_xlabel("Time (s)")
+    # Subplot #3: Kalman filter P
+    axs[2].set_title("Kalman Filter Error Covariance (P) over time")
+    axs[2].plot(time_vals, P_history, label="P(t)")
+    axs[2].legend()
+    axs[2].set_xlabel("Time (s)")
+    axs[2].grid(True)
 
     plt.tight_layout()
-    plt.show()  # interactive: user can zoom/pan
+    plt.show()
 
-# =======================
-# Main
-# =======================
+
+# --------------------------------------------------
+# Main function
+# --------------------------------------------------
 def process_all_csvs(datafolder):
     """
     1. Iterate CSV files that match s*_*.csv.
-    2. Skip invalid (non-data) files.
+    2. Skip invalid files.
     3. Write RMSE results to 'evaluation_log.txt' AND print them to console.
-    4. If PLOT_SPECIFIC_FILE is set, produce an interactive wave+peaks plot
-       that also shows ground-truth ECG as vertical lines.
-    5. Produce bar charts of (Fused_RMSE - pleth_2_RMSE) for:
-         - All valid files combined
-         - Subsets: run, sit, walk
+    4. For each file (or the PLOT_SPECIFIC_FILE), plot:
+         - Three channels + GT peaks
+         - Fused signal + peaks + GT peaks
+         - Kalman P over time
+    5. Produce bar charts of the differences in RMSE if desired.
     """
     csv_files = glob.glob(os.path.join(datafolder, "s*_*.csv"))
     csv_files = sorted(csv_files)
@@ -256,7 +321,7 @@ def process_all_csvs(datafolder):
 
             # fuse signals
             channels_to_fuse = ["pleth_1","pleth_2","pleth_3"]
-            fused_signal = kalman_fuse_3channels(df, channels_to_fuse, fs)
+            fused_signal, P_history, three_ch_filtered = kalman_fuse_3channels(df, channels_to_fuse, fs)
             fused_peaks_idx = detect_peaks_ampd(fused_signal, AMPD_WINDOW_LENGTH)
             fused_peak_times = df["time_sec"].values[fused_peaks_idx] if len(fused_peaks_idx) else np.array([])
 
@@ -282,11 +347,17 @@ def process_all_csvs(datafolder):
             print(msg)
             fout.write(f"{base},{rmse_fused:.4f},{rmse_IR:.4f}\n")
 
-            # If user wants to see wave+peaks for this specific file -> interactive plot
-            if PLOT_SPECIFIC_FILE and (base == PLOT_SPECIFIC_FILE):
-                print(f"Plotting waveforms for {base} (with ground-truth). Close the plot window to continue.")
-                plot_signals_with_groundtruth(df, fused_signal, fused_peaks_idx,
-                                              IR_filtered, IR_peaks_idx)
+            # Plot for each file (or only if matching PLOT_SPECIFIC_FILE)
+            if (not PLOT_SPECIFIC_FILE) or (base == PLOT_SPECIFIC_FILE):
+                # Plot all signals
+                print(f"Plotting signals for {base}. Close the figure to continue.")
+                plot_all_signals_and_kalmanP(
+                    df,
+                    three_ch_filtered,  # shape (3, N)
+                    fused_signal, fused_peaks_idx,
+                    IR_filtered, IR_peaks_idx,
+                    P_history
+                )
 
             # --- Place file into (run / sit / walk) groups based on name ---
             lower_name = base.lower()
@@ -302,7 +373,6 @@ def process_all_csvs(datafolder):
                 walk_files.append(base)
                 walk_fused.append(rmse_fused)
                 walk_IR.append(rmse_IR)
-            # else: if it doesn't match run/sit/walk, we just won't include it in those categories
 
     # === After all files processed, compute overall stats
     all_fused = np.array(rmse_fused_list, dtype=float)
@@ -335,7 +405,7 @@ def process_all_csvs(datafolder):
     print(f"Mean RMSE (Fused vs GT):   {overall_rmse_fused:.2f}")
     print(f"Mean RMSE (pleth_2 vs GT): {overall_rmse_IR:.2f}")
 
-    # --- Now create a bar chart of differences: (Fused_RMSE - pleth_2_RMSE) for all files ---
+    # --- Now create a bar chart of differences: (Fused_RMSE - IR_RMSE) for all files ---
     if len(filenames) > 0:
         # Filter only valid
         valid_idx = [i for i in range(len(filenames))
@@ -345,9 +415,8 @@ def process_all_csvs(datafolder):
             fused_vals  = all_fused[valid_idx]
             pl2_vals    = all_IR[valid_idx]
 
-            differences = fused_vals - pl2_vals  # Positive = Fused is worse (larger RMSE)
-            
-            # Create color map: negative => green, positive => orange, zero => gray
+            differences = fused_vals - pl2_vals  # Positive => Fused has larger (worse) RMSE
+            # Color map
             colors = []
             for d in differences:
                 if d < 0:
@@ -365,7 +434,6 @@ def process_all_csvs(datafolder):
             plt.ylabel("Difference in RMSE (Fused - IR) [BPM]")
             plt.title("Per-file RMSE Difference (Fused - IR)")
             plt.tight_layout()
-
             print("\nShowing bar plot of (Fused_RMSE - IR_RMSE) for all valid files. Close the window to continue.")
             plt.show()
         else:
@@ -373,11 +441,11 @@ def process_all_csvs(datafolder):
     else:
         print("No CSV files processed - no bar plot of difference created.")
 
-    # --- Plot difference bars for run, sit, walk categories separately ---
+    # --- Plot difference bars for run, sit, walk categories ---
     def plot_difference_bar(files_list, fused_list, pl2_list, category_name):
         """
         Create an interactive bar chart for a given category (run/sit/walk),
-        showing (Fused_RMSE - pleth_2_RMSE).
+        showing (Fused_RMSE - IR_RMSE).
         Negative => green, positive => orange, zero => gray.
         """
         fused_arr = np.array(fused_list, dtype=float)
