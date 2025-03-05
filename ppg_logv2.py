@@ -18,6 +18,7 @@ num_channels = 9  # e.g., 415nm, 445nm, 480nm, 515nm, 555nm, 590nm, 630nm, 680nm
 channel_names = ["415nm", "445nm", "480nm", "515nm", "555nm", "590nm", "630nm", "680nm", "NIR"]
 
 # ========== Channel Visibility Switches ==========
+# If a channel is set to False here, we skip plotting AND skip it in the Kalman Filter fusion.
 channel_visibility = {
     "415nm": True,
     "445nm": True,
@@ -29,6 +30,10 @@ channel_visibility = {
     "680nm": True,
     "NIR": True,
 }
+
+# If you want to keep them visible in the plot, but still exclude them from the fusion,
+# you could introduce a separate dictionary, e.g. "channel_fusion_enabled". But here,
+# we'll tie both the plot visibility and the KF usage to the same flag for simplicity.
 
 unfiltered_visibility = {
     "415nm": False,
@@ -110,8 +115,7 @@ ax1.set_ylim(0, 1)
 Fs = None
 start_time = None
 
-# ========== MODIFIED: 1D Kalman Filter for SNR-based Summation ==========
-# We no longer do dim_z=9. Instead, we track 1D state "x(t)" and feed a single measurement z(t).
+# ========== 1D Kalman Filter for SNR-based Summation ==========
 kf = KalmanFilter(dim_x=1, dim_z=1)
 kf.x = np.array([[0.]])  # initial state
 kf.P *= 10.0
@@ -208,39 +212,42 @@ def update(frame):
                 if Ts and Ts > 0:
                     Fs = 1.0 / Ts
 
-            # ========== MODIFIED: SNR-based Summation for the Kalman Filter ==========
-            # We'll do:
-            #   (1) Bandpass each channel's ENTIRE buffer -> get the LATEST filtered sample
-            #   (2) SNR_i = abs(latest_filtered_sample) + small_offset
-            #   (3) z_t = sum_i [ SNR_i * latest_filtered_sample_i ]
-            #   (4) 1D KF update with z_t
-
+            # ========== SNR-based Summation for the Kalman Filter ==========
+            # If a channel is invisible, we skip it in the sum (set its SNR weighting to zero).
+            fused_value = 0.0
             if Fs and all(len(ppg_raw[ch]) > max(order * 3, 10) for ch in range(num_channels)):
-                # We'll bandpass each channel, get the last sample
                 bandpassed_last_samples = []
                 for i in range(num_channels):
-                    raw_arr = np.array(ppg_raw[i])
-                    b_i, a_i = butter(order, [lowcut, highcut], btype='band', fs=Fs)
-                    filtered_arr = filtfilt(b_i, a_i, raw_arr)
-                    last_val = filtered_arr[-1]
-                    bandpassed_last_samples.append(last_val)
+                    ch_name = channel_names[i]
+                    # If the channel is visible, we actually filter it and incorporate in the sum.
+                    # If invisible, skip or treat as zero.
+                    if channel_visibility[ch_name]:
+                        raw_arr = np.array(ppg_raw[i])
+                        b_i, a_i = butter(order, [lowcut, highcut], btype='band', fs=Fs)
+                        filtered_arr = filtfilt(b_i, a_i, raw_arr)
+                        last_val = filtered_arr[-1]
+                        bandpassed_last_samples.append(last_val)
+                    else:
+                        bandpassed_last_samples.append(None)
 
-                # Compute SNR for each channel's last sample
-                # (Naive approach: snr_i = abs(value) + small offset)
-                snrs = [abs(x) + 1e-6 for x in bandpassed_last_samples]
-
-                # Weighted sum => single measurement
+                # Compute SNR for each visible channel's last sample
+                # We do a naive approach: snr_i = abs(value) + offset
                 z_t = 0.0
                 for i in range(num_channels):
-                    z_t += snrs[i] * bandpassed_last_samples[i]
-
+                    val = bandpassed_last_samples[i]
+                    if val is not None:
+                        snr_i = abs(val) + 1e-6
+                        z_t += snr_i * val
                 # KF predict/update
                 kf.predict()
-                kf.update(z_t)  # dim_z=1 => single scalar
+                kf.update(z_t)
                 fused_value = kf.x[0, 0]
             else:
-                # If not enough samples or Fs not set, just do a direct sum
-                fused_value = sum(channel_values)
+                # If not enough samples or Fs not set, just do a direct sum of visible channels
+                for i in range(num_channels):
+                    ch_name = channel_names[i]
+                    if channel_visibility[ch_name]:
+                        fused_value += channel_values[i]
 
             # Store fused signal
             times_fused.append(elapsed_time)
@@ -325,7 +332,7 @@ def update(frame):
 
                         filtered_norms[i] = filtered_norm
                     else:
-                        # Channel not visible
+                        # Channel not visible => clear all lines
                         lines_filtered[i].set_data([], [])
                         lines_unfiltered[i].set_data([], [])
                         lines_peaks[i].set_data([], [])

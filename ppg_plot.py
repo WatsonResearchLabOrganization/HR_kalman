@@ -176,12 +176,12 @@ if __name__ == "__main__":
     # python compare_ppg_biopac.py ppg_data.csv Untitled1.acq.txt
     #
     # Or pass additional arguments for separate window lengths
-    ppg_csv_file = "yhc_sit_5mins.csv"
-    biopac_txt_file = "yhc_sit_5mins.txt"
+    ppg_csv_file = "ppg_cx_hold.csv"
+    biopac_txt_file = "cx_hold_ecg.txt"
 
     # set your desired AMPD windows
     PPG_WINDOW = 160
-    BIOPAC_WINDOW = 4000
+    BIOPAC_WINDOW = 15000
 
     main(ppg_csv_file, biopac_txt_file,
          ppg_ampd_window=PPG_WINDOW,

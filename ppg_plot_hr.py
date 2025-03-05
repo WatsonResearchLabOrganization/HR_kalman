@@ -64,6 +64,7 @@ def parse_ppg_csv(ppg_csv_file):
     """
     df = pd.read_csv(ppg_csv_file)
     df['time'] = pd.to_datetime(df['Timestamp'], errors='coerce')
+
     # Keep only filtered columns + 'time'
     filtered_cols = [c for c in df.columns if c.endswith('_filtered')]
     keep_cols = ['time'] + filtered_cols
@@ -71,6 +72,7 @@ def parse_ppg_csv(ppg_csv_file):
     df.dropna(subset=['time'], inplace=True)
     df.sort_values(by='time', inplace=True)
     df.reset_index(drop=True, inplace=True)
+
     return df
 
 
@@ -107,7 +109,6 @@ def get_peaks_time(df, col_name, ampd_window=160):
     """
     Given a DataFrame with 'time' and a column col_name,
     detect peaks and return the array of peak times (as np.array).
-
     Using df.iloc[...] so that 0-based indices from AMPD
     map correctly to the DataFrame rows.
     """
@@ -123,7 +124,6 @@ def compute_instantaneous_hr(peak_times):
     compute instantaneous HR from consecutive peak intervals:
        HR = 60 / (time_diff_in_seconds).
     We assign the resulting HR to the midpoint time between each pair of peaks.
-
     Returns: two arrays (times, hrs)
     """
     if len(peak_times) < 2:
@@ -157,10 +157,10 @@ def main(ppg_csv_file, biopac_txt_file,
     3. Compute instantaneous HR from consecutive peaks.
     4. Filter out abnormal HR (<40 or >200).
     5. Merge with groundtruth on nearest time (for alignment).
-    6. Plot on a 45° line: x = HR_bio, y = HR_nir/fused, plus identity line.
+    6. Plot HR vs time, then a 45° identity scatter plot (Bio vs Est).
     """
 
-    # 1) Parse
+    # 1) Parse the data
     df_ppg = parse_ppg_csv(ppg_csv_file)
     df_biopac = parse_biopac_txt(biopac_txt_file)
 
@@ -195,21 +195,21 @@ def main(ppg_csv_file, biopac_txt_file,
     df_fused_hr.sort_values('time', inplace=True)
     df_bio_hr.sort_values('time', inplace=True)
 
-    # Merge onto Biopac
-    df_merged = pd.merge_asof(df_bio_hr, df_nir_hr, on='time', direction='nearest', tolerance=pd.Timedelta(seconds=2))
-    df_merged = pd.merge_asof(df_merged, df_fused_hr, on='time', direction='nearest', tolerance=pd.Timedelta(seconds=2))
+    # 4) Merge onto Biopac, filter out abnormal HR
+    df_merged = pd.merge_asof(df_bio_hr, df_nir_hr, on='time',
+                              direction='nearest', tolerance=pd.Timedelta(seconds=2))
+    df_merged = pd.merge_asof(df_merged, df_fused_hr, on='time',
+                              direction='nearest', tolerance=pd.Timedelta(seconds=2))
 
-    # 4) Filter out abnormal HR
     def valid_hr(x):
         return 40.0 <= x <= 200.0
 
     df_merged['HR_bio'] = df_merged['HR_bio'].apply(lambda x: x if valid_hr(x) else np.nan)
     df_merged.dropna(subset=['HR_bio'], inplace=True)  # must have groundtruth
-
     df_merged['HR_nir'] = df_merged['HR_nir'].apply(lambda x: x if valid_hr(x) else np.nan)
     df_merged['HR_fused'] = df_merged['HR_fused'].apply(lambda x: x if valid_hr(x) else np.nan)
 
-    # 5) We'll compute MSE for all valid pairs
+    # 5) Compute MSE
     df_nir_valid = df_merged.dropna(subset=['HR_nir'])
     df_fused_valid = df_merged.dropna(subset=['HR_fused'])
 
@@ -223,17 +223,22 @@ def main(ppg_csv_file, biopac_txt_file,
     print(f"MSE (NIR vs Biopac)   = {mse_nir}")
     print(f"MSE (Fused vs Biopac) = {mse_fused}")
 
-    # 6) Plot a 45° identity line, groundtruth on X, estimated on Y
-    # -------------------------------------------------------------
-    # We'll do one figure with two scatter plots:
-    #   - NIR vs Bio
-    #   - Fused vs Bio
-    # plus the line y = x from min to max HR.
+    # 6a) Plot HR vs Time (Biopac, NIR, Fused)
+    plt.figure(figsize=(10, 6))
+    plt.plot(df_bio_hr['time'], df_bio_hr['HR_bio'], marker='.', label='Biopac (Ground Truth)')
+    plt.plot(df_nir_hr['time'], df_nir_hr['HR_nir'], marker='.', label='NIR')
+    plt.plot(df_fused_hr['time'], df_fused_hr['HR_fused'], marker='.', label='Fused')
+    plt.xlabel('Time')
+    plt.ylabel('Heart Rate (BPM)')
+    plt.title('Heart Rate vs Time')
+    plt.legend(loc='best')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
 
+    # 6b) Plot a 45° identity line comparing HR estimates to ground truth
     plt.figure(figsize=(7, 6))
 
-    # Prepare x,y for each estimate
-    # (We only plot the rows that have valid values for each estimate).
     # For NIR
     bio_x_nir = df_nir_valid['HR_bio']
     nir_y = df_nir_valid['HR_nir']
@@ -245,10 +250,10 @@ def main(ppg_csv_file, biopac_txt_file,
     plt.scatter(bio_x_nir, nir_y, color='red', alpha=0.7, label='NIR')
     plt.scatter(bio_x_fused, fused_y, color='black', alpha=0.7, label='Fused')
 
-    # Identity line: we can define from the min to max of the data or a fixed 40–200 range.
+    # Plot the identity line
     all_bio_vals = df_merged['HR_bio'].dropna()
-    min_hr = max(40, all_bio_vals.min())  # at least 40
-    max_hr = min(200, all_bio_vals.max()) # at most 200
+    min_hr = max(40, all_bio_vals.min())
+    max_hr = min(200, all_bio_vals.max())
     line_x = np.linspace(min_hr, max_hr, 200)
     line_y = line_x
     plt.plot(line_x, line_y, 'b--', label='y=x (45° line)')
@@ -264,11 +269,12 @@ def main(ppg_csv_file, biopac_txt_file,
 
 
 if __name__ == "__main__":
-    ppg_csv_file = "yhc_hold_breath_5mins.csv"
-    biopac_txt_file = "yhc_hold_breath_5mins.txt"
+    # Adjust file names or parameters as needed
+    ppg_csv_file = "ppg_cx_hold.csv"
+    biopac_txt_file = "cx_hold_ecg.txt"
 
     main(ppg_csv_file, biopac_txt_file,
          nir_col="NIR_filtered",
          fused_col="Fused_filtered",
          ppg_ampd_window=160,
-         biopac_ampd_window=4000)
+         biopac_ampd_window=15000)
